@@ -1,10 +1,9 @@
 import streamlit as st
 import pandas as pd
-
 from snowflake.snowpark import Session
 
 # ---------------------------
-# Snowflake session (Streamlit Cloud)
+# Snowflake session (Streamlit Cloud compatible)
 # ---------------------------
 cfg = st.secrets["connections"]["snowflake"]
 session = Session.builder.configs(cfg).create()
@@ -31,13 +30,19 @@ def load_data():
     df = session.sql(query).to_pandas()
 
     # Ensure SALE_DATE is datetime
-    df['SALE_DATE'] = pd.to_datetime(df['SALE_DATE'], errors='coerce')
+    df["SALE_DATE"] = pd.to_datetime(df["SALE_DATE"], errors="coerce")
 
     # Clean product names
-    df['PRODUCT'] = df['PRODUCT'].astype(str).str.strip().str.upper()
+    df["PRODUCT"] = df["PRODUCT"].astype(str).str.strip().str.upper()
 
     # Remove rows with null critical fields
-    df = df.dropna(subset=['SALE_DATE', 'PRODUCT', 'QUANTITY', 'UNIT_PRICE'])
+    df = df.dropna(subset=["SALE_DATE", "PRODUCT", "QUANTITY", "UNIT_PRICE"])
+
+    # ✅ REMOVE DUPLICATES (important)
+    df = df.drop_duplicates(
+        subset=["SALE_DATE", "PRODUCT", "QUANTITY", "UNIT_PRICE"]
+    )
+
     return df
 
 df = load_data()
@@ -46,17 +51,22 @@ df = load_data()
 # Sidebar Filters
 # ---------------------------
 st.sidebar.header("Filters")
+
 products = sorted(df["PRODUCT"].unique())
-selected_products = st.sidebar.multiselect("Select Products", products, default=products)
+selected_products = st.sidebar.multiselect(
+    "Select Products", products, default=products
+)
 
 min_date = df["SALE_DATE"].min()
 max_date = df["SALE_DATE"].max()
-date_range = st.sidebar.date_input("Select Date Range", [min_date, max_date])
+date_range = st.sidebar.date_input(
+    "Select Date Range", [min_date, max_date]
+)
 
 filtered_df = df[
-    (df["PRODUCT"].isin(selected_products)) &
-    (df["SALE_DATE"] >= pd.to_datetime(date_range[0])) &
-    (df["SALE_DATE"] <= pd.to_datetime(date_range[1]))
+    (df["PRODUCT"].isin(selected_products))
+    & (df["SALE_DATE"] >= pd.to_datetime(date_range[0]))
+    & (df["SALE_DATE"] <= pd.to_datetime(date_range[1]))
 ]
 
 # ---------------------------
@@ -65,15 +75,19 @@ filtered_df = df[
 if filtered_df.empty:
     st.warning("No data to display for the selected filters.")
 else:
-    # KPIs
     st.subheader("Key Metrics")
+
     total_revenue = (filtered_df["QUANTITY"] * filtered_df["UNIT_PRICE"]).sum()
     total_units = filtered_df["QUANTITY"].sum()
     low_stock = filtered_df[filtered_df["STOCK_QUANTITY"] < 10]["PRODUCT"].tolist()
+
     col1, col2, col3 = st.columns(3)
     col1.metric("💰 Total Revenue", f"€{total_revenue:,.2f}")
     col2.metric("📦 Total Units Sold", int(total_units))
-    col3.metric("⚠️ Low Stock Products", ", ".join(low_stock) if low_stock else "None")
+    col3.metric(
+        "⚠️ Low Stock Products",
+        ", ".join(sorted(set(low_stock))) if low_stock else "None",
+    )
 
     # Daily Revenue
     st.subheader("Daily Revenue")
@@ -87,14 +101,14 @@ else:
 
     # Weekly Revenue
     st.subheader("Weekly Revenue Trends")
-    filtered_df['WEEK'] = filtered_df['SALE_DATE'].dt.isocalendar().week
+    filtered_df["WEEK"] = filtered_df["SALE_DATE"].dt.isocalendar().week
     weekly_revenue = (
-        filtered_df.groupby('WEEK')
+        filtered_df.groupby("WEEK")
         .apply(lambda x: (x["QUANTITY"] * x["UNIT_PRICE"]).sum())
         .reset_index()
     )
-    weekly_revenue.columns = ['WEEK', 'REVENUE']
-    st.line_chart(weekly_revenue.set_index('WEEK')['REVENUE'])
+    weekly_revenue.columns = ["WEEK", "REVENUE"]
+    st.line_chart(weekly_revenue.set_index("WEEK")["REVENUE"])
 
     # Revenue by Product
     st.subheader("Revenue by Product")
@@ -117,18 +131,19 @@ else:
 
     # Download Filtered Data
     st.subheader("Download Filtered Data")
-    csv = filtered_df.to_csv(index=False).encode('utf-8')
+    csv = filtered_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="📥 Download CSV",
         data=csv,
-        file_name='filtered_sales.csv',
-        mime='text/csv'
+        file_name="filtered_sales.csv",
+        mime="text/csv",
     )
 
 # ---------------------------
 # Add New Sale (manual entry)
 # ---------------------------
 st.sidebar.header("Add New Sale")
+
 with st.sidebar.form("add_sale_form"):
     sale_date = st.date_input("Sale Date")
     product = st.selectbox("Product", products)
@@ -138,66 +153,84 @@ with st.sidebar.form("add_sale_form"):
 
     if submit_sale:
         session.sql(f"""
-            INSERT INTO SALES (SALE_DATE, PRODUCT, QUANTITY, UNIT_PRICE, STOCK_QUANTITY)
-            VALUES ('{sale_date}', '{product}', {quantity}, {unit_price}, 0)
+            MERGE INTO SALES t
+            USING (
+                SELECT
+                    '{sale_date}' AS SALE_DATE,
+                    '{product}' AS PRODUCT,
+                    {quantity} AS QUANTITY,
+                    {unit_price} AS UNIT_PRICE
+            ) s
+            ON t.SALE_DATE = s.SALE_DATE
+            AND t.PRODUCT = s.PRODUCT
+            AND t.QUANTITY = s.QUANTITY
+            AND t.UNIT_PRICE = s.UNIT_PRICE
+            WHEN NOT MATCHED THEN
+            INSERT (SALE_DATE, PRODUCT, QUANTITY, UNIT_PRICE, STOCK_QUANTITY)
+            VALUES (s.SALE_DATE, s.PRODUCT, s.QUANTITY, s.UNIT_PRICE, 0)
         """).collect()
+
         st.success(f"Sale added for {product}! Refresh to see updates.")
-
-# ---------------------------
-# Update Inventory
-# ---------------------------
-st.sidebar.header("Update Inventory")
-with st.sidebar.form("update_stock_form"):
-    stock_product = st.selectbox("Select Product to Update Stock", products)
-    stock_change = st.number_input("Change Stock Quantity (+/-)", min_value=-1000, max_value=1000, step=1)
-    submit_stock = st.form_submit_button("Update Stock")
-
-    if submit_stock:
-        session.sql(f"""
-            UPDATE SALES
-            SET STOCK_QUANTITY = STOCK_QUANTITY + {stock_change}
-            WHERE PRODUCT = '{stock_product}'
-        """).collect()
-        st.success(f"Stock updated for {stock_product}! Refresh to see changes.")
 
 # ---------------------------
 # Upload CSV for new sales
 # ---------------------------
 st.sidebar.header("Upload Sales CSV")
-uploaded_file = st.sidebar.file_uploader("Upload CSV", type=['csv'])
+
+uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+
 if uploaded_file:
     new_sales = pd.read_csv(uploaded_file)
 
-    # Clean and validate
-    new_sales['SALE_DATE'] = pd.to_datetime(new_sales['SALE_DATE'], errors='coerce')
-    new_sales['PRODUCT'] = new_sales['PRODUCT'].astype(str).str.strip().str.upper()
-    new_sales = new_sales.dropna(subset=['SALE_DATE', 'PRODUCT', 'QUANTITY', 'UNIT_PRICE'])
+    new_sales["SALE_DATE"] = pd.to_datetime(
+        new_sales["SALE_DATE"], errors="coerce"
+    )
+    new_sales["PRODUCT"] = (
+        new_sales["PRODUCT"].astype(str).str.strip().str.upper()
+    )
+
+    new_sales = new_sales.dropna(
+        subset=["SALE_DATE", "PRODUCT", "QUANTITY", "UNIT_PRICE"]
+    )
+
+    # ✅ Remove duplicates inside CSV
+    new_sales = new_sales.drop_duplicates(
+        subset=["SALE_DATE", "PRODUCT", "QUANTITY", "UNIT_PRICE"]
+    )
 
     for _, row in new_sales.iterrows():
         session.sql(f"""
-            INSERT INTO SALES (SALE_DATE, PRODUCT, QUANTITY, UNIT_PRICE, STOCK_QUANTITY)
-            VALUES ('{row['SALE_DATE'].date()}', '{row['PRODUCT']}', {row['QUANTITY']}, {row['UNIT_PRICE']}, {row.get('STOCK_QUANTITY',0)})
+            MERGE INTO SALES t
+            USING (
+                SELECT
+                    '{row["SALE_DATE"].date()}' AS SALE_DATE,
+                    '{row["PRODUCT"]}' AS PRODUCT,
+                    {row["QUANTITY"]} AS QUANTITY,
+                    {row["UNIT_PRICE"]} AS UNIT_PRICE
+            ) s
+            ON t.SALE_DATE = s.SALE_DATE
+            AND t.PRODUCT = s.PRODUCT
+            AND t.QUANTITY = s.QUANTITY
+            AND t.UNIT_PRICE = s.UNIT_PRICE
+            WHEN NOT MATCHED THEN
+            INSERT (SALE_DATE, PRODUCT, QUANTITY, UNIT_PRICE, STOCK_QUANTITY)
+            VALUES (s.SALE_DATE, s.PRODUCT, s.QUANTITY, s.UNIT_PRICE, 0)
         """).collect()
 
-    st.success(f"{len(new_sales)} new sales loaded from CSV! Refresh to see updates.")
-
+    st.success(f"{len(new_sales)} new sales loaded without duplicates!")
 
 # ---------------------------
-# Full Low Stock Products View
+# Low Stock Products (Aggregated)
 # ---------------------------
 st.subheader("⚠️ Low Stock Products (Full List)")
 
-# Aggregate stock per product
 low_stock_df = (
     df.groupby("PRODUCT", as_index=False)
-    .agg({"STOCK_QUANTITY": "sum"})  # Sum stock per product
+    .agg({"STOCK_QUANTITY": "sum"})
+    .sort_values("STOCK_QUANTITY")
 )
 
-# Filter only products with stock < 10
 low_stock_df = low_stock_df[low_stock_df["STOCK_QUANTITY"] < 10]
-
-# Sort by ascending stock
-low_stock_df = low_stock_df.sort_values("STOCK_QUANTITY").reset_index(drop=True)
 
 if low_stock_df.empty:
     st.info("All products have sufficient stock.")
